@@ -3,7 +3,7 @@ import numpy as np
 import copy
 from active_learning.uncertainty_learner import UncertaintyActiveLearner
 from active_testing.active_tester import ActiveTester
-from utils.losses import cross_entropy_loss
+from utils.losses import cross_entropy_loss, entropy
 
 class ATLFramework:
     def __init__(self, model, X_pool, y_pool=None, initial_labeled_indices=None, 
@@ -64,83 +64,196 @@ class ATLFramework:
         return X_unlabeled, unlabeled_indices
     
     def perform_active_quiz(self, al_round):
+        """
+        アクティブクイズを実行してモデルを評価します
+        
+        Parameters:
+        -----------
+        al_round : int
+            現在のアクティブラーニングラウンド
+        
+        Returns:
+        --------
+        selected_indices : list
+            選択されたテストサンプルのインデックスリスト
+        """
+        # 未ラベルデータを取得
         X_unlabeled, unlabeled_indices = self.get_unlabeled_data()
+        
         if len(X_unlabeled) == 0 or len(unlabeled_indices) == 0:
             return []
+        
+        # 現在のラベル付きデータとテストデータを取得
         X_labeled, y_labeled = self.get_labeled_data()
         X_test, y_test = self.get_test_data()
-        multi_source_risk = self.active_tester.compute_multi_source_risk(
-            X_labeled, y_labeled, X_test, y_test, X_unlabeled
-        )
+        
+        # 多ソースリスク推定を計算
+        # 論文の式(5)に忠実に実装
+        train_weight = len(X_labeled)
+        pool_weight = len(X_unlabeled)
+        test_weight = len(X_test)
+        
+        # 訓練リスク（より正確に計算）
+        if len(X_labeled) > 0:
+            # K分割交差検証でより正確な訓練リスクを推定
+            n_splits = min(5, len(X_labeled))
+            train_risks = []
+            
+            # データをシャッフル
+            indices = np.random.permutation(len(X_labeled))
+            X_labeled_shuffled = X_labeled[indices]
+            y_labeled_shuffled = y_labeled[indices]
+            
+            # 簡易的なK分割交差検証
+            split_size = len(X_labeled) // n_splits
+            for i in range(n_splits):
+                start_idx = i * split_size
+                end_idx = (i + 1) * split_size if i < n_splits - 1 else len(X_labeled)
+                
+                # 検証セットとトレーニングセットを分割
+                val_indices = indices[start_idx:end_idx]
+                train_indices = np.concatenate([indices[:start_idx], indices[end_idx:]])
+                
+                # 一時的なモデルを訓練
+                temp_model = copy.deepcopy(self.model)
+                temp_model.fit(X_labeled[train_indices], y_labeled[train_indices])
+                
+                # 検証セットでリスクを計算
+                val_probs = temp_model.predict_proba(X_labeled[val_indices])
+                val_risk = cross_entropy_loss(val_probs, y_labeled[val_indices])
+                train_risks.append(val_risk)
+            
+            train_risk = np.mean(train_risks)
+        else:
+            train_risk = 0
+        
+        # プールリスク
+        pool_probs = self.model.predict_proba(X_unlabeled)
+        pool_risk = np.mean(entropy(pool_probs))
+        
+        # テストリスク
+        if len(X_test) > 0:
+            test_weights = np.ones(len(X_test)) / len(X_test)  # 均等な重み
+            test_risk = self.active_tester.estimate_risk(X_test, y_test, test_weights)
+        else:
+            test_risk = 0
+        
+        # 多ソースリスク推定を計算
+        total_weight = train_weight + pool_weight + test_weight
+        if total_weight > 0:
+            multi_source_risk = (train_weight * train_risk + pool_weight * pool_risk + test_weight * test_risk) / total_weight
+        else:
+            multi_source_risk = 0
+        
+        # テスト提案を計算
         excluded_indices = self.labeled_indices + self.test_indices
-        # テスト提案
-        q_proposal = self.active_tester.compute_test_proposal(self.X_pool, excluded_indices, multi_source_risk)
-        # テストサンプル選択
+        q_proposal = self.active_tester.compute_test_proposal(
+            self.X_pool, excluded_indices, multi_source_risk
+        )
+        
+        # テストサンプルを選択
         selected_indices, weights = self.active_tester.select_test_samples(
             self.X_pool, q_proposal, n_samples=self.test_batch_size, excluded_indices=excluded_indices
         )
+        
+        # テストインデックスを更新
         self.test_indices.extend(selected_indices)
+        
+        # 選択されたテストデータを取得
         X_quiz = self.X_pool[selected_indices]
-        y_quiz = self.y_pool[selected_indices]
-
+        y_quiz = self.y_pool[selected_indices] if self.y_pool is not None else None
+        
+        # クイズデータを後の統合のために保存
         self.quiz_X.append(X_quiz)
         self.quiz_y.append(y_quiz)
         self.quiz_weights.append(weights)
-        # クイズでモデルがどれだけ間違えたか
+        
+        # このクイズのリスクを推定
         quiz_risk = self.active_tester.estimate_risk(X_quiz, y_quiz, weights)
         self.risk_history.append(quiz_risk)
-        # これまでのクイズ結果を信頼度で重みづけして合成（全体のリスク推定））
+        
+        # 統合リスク推定値を計算
         integrated_risk = self.active_tester.integrated_risk_estimation(
             self.quiz_X, self.quiz_y, self.quiz_weights
         )
         self.integrated_risk_history.append(integrated_risk)
-        # 全データの正解ラベルがある場合：本当のリスク計算
+        
+        # 真のラベルが利用可能な場合、評価用に真のリスクを計算
         if self.y_pool is not None:
             true_risk = cross_entropy_loss(self.model.predict_proba(self.X_pool), self.y_pool)
             self.true_risk_history.append(true_risk)
         
-        n_feedback = int(self.feedback_ratio * len(selected_indices)) # 何個フィードバックに使用するか
+        # フィードバックサンプルを選択
+        n_feedback = int(self.feedback_ratio * len(selected_indices))
         if n_feedback > 0:
-            feedback_indices = self.active_tester.select_feedback_samples(X_quiz, y_quiz, X_labeled, selected_indices, q_proposal, n_feedback=n_feedback)
-            self.feedback_indices = feedback_indices
+            feedback_indices = self.active_tester.select_feedback_samples(
+                X_quiz, y_quiz, X_labeled, selected_indices, q_proposal, n_feedback=n_feedback
+            )
+            
+            # フィードバックインデックスを更新
+            self.feedback_indices.extend(feedback_indices)
+            
+            # フィードバックサンプルをラベル付きセットに追加
             self.labeled_indices.extend(feedback_indices)
             self.active_learner.labeled_indices.extend(feedback_indices)
-            # feedback sampleをtest indexから削除
+            
+            # フィードバックサンプルをテストインデックスから削除
             self.test_indices = [idx for idx in self.test_indices if idx not in feedback_indices]
         
         return selected_indices
     
     def check_early_stopping(self):
-        # 早期停止条件のチェック
+        """
+        早期停止条件を満たしているかチェックします
+        
+        Returns:
+        --------
+        stop : bool
+            早期停止条件を満たしている場合はTrue
+        """
         if len(self.integrated_risk_history) < self.window_size + 1:
             return False
-        # 移動平均
-        window = self.window_size 
+            
+        # 統合リスクの移動平均の変化を計算
+        window = self.window_size
         current_avg = np.mean(self.integrated_risk_history[-window:])
         previous_avg = np.mean(self.integrated_risk_history[-(window+1):-1])
         delta_risk = abs(current_avg - previous_avg)
-
+        
+        # 未ラベルデータを取得
         X_unlabeled, _ = self.get_unlabeled_data()
-        # ラベルを追加する前後での予測変化
+        
+        # 安定化予測（SP）を計算
         if len(X_unlabeled) > 0:
-            # 現在のモデル予測
+            # 現在のモデル予測を取得
             current_probs = self.model.predict_proba(X_unlabeled)
-            # 最後に追加したサンプル以外でモデルをトレーニング
+            
+            # 最新のサンプルなしで一時的なモデルを訓練
             temp_model = copy.deepcopy(self.model)
             X_prev_labeled = self.X_pool[self.labeled_indices[:-self.test_batch_size]]
             y_prev_labeled = self.y_pool[self.labeled_indices[:-self.test_batch_size]]
             temp_model.fit(X_prev_labeled, y_prev_labeled)
-
+            
+            # 以前の予測を取得
             prev_probs = temp_model.predict_proba(X_unlabeled)
+            
+            # 予測変化を計算
             pred_changes = np.mean(np.abs(current_probs - prev_probs))
             sp = 1 - pred_changes
-        else: 
+        else:
             sp = 1.0
+            
+        # 組み合わせた停止基準（より厳しくして早期停止を防ぐ）
+        threshold = 0.005  # リスク変化のしきい値を小さく
+        sp_threshold = 0.98  # 安定化予測のしきい値を大きく
         
-        threshold = 0.01
-        sp_threshold = 0.95
+        # 最低ラウンド数を確保
+        min_rounds = 10
+        if len(self.integrated_risk_history) < min_rounds:
+            return False
+        
         return delta_risk < threshold and sp > sp_threshold
-    
+
     def run_active_learning(self, n_rounds=10, n_samples_per_round=10):
         for al_round in range(n_rounds):
             print(f"Active Learning Round {al_round+1}/{n_rounds}")
