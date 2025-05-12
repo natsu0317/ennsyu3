@@ -14,7 +14,7 @@ class ActiveTester:
 
     def compute_test_proposal(self, X_pool, excluded_indices=None, multi_source_risk=None):
         """
-        最適なテスト提案分布を計算します（論文の式(4)）
+        最適なテスト提案分布を計算します（論文の式(4)と付録B.1に基づく）
         
         Parameters:
         -----------
@@ -32,7 +32,7 @@ class ActiveTester:
         """
         if excluded_indices is None:
             excluded_indices = []
-        
+            
         # プールのサンプルに対する予測確率を取得
         probs = self.model.predict_proba(X_pool)
         
@@ -46,40 +46,34 @@ class ActiveTester:
         # 式(4)の期待二乗差分項を計算
         # q*(x) ∝ p(x) * sqrt(∫[L(fθ(x), y) - R]²p(y|x)dy)
         
-        # 各サンプルの期待二乗差分を計算
-        n_classes = probs.shape[1] if len(probs.shape) > 1 else 2
-        expected_sq_diff = np.zeros(len(X_pool))
+        # 各クラスの予測確率に基づいて損失の期待値を計算
+        expected_squared_diff = np.zeros(len(X_pool))
         
         for i in range(len(X_pool)):
-            # 各クラスについて期待値を計算
-            sq_diff_sum = 0
-            for c in range(n_classes):
-                # クラスcに対する予測確率 p(y|x)
-                p_y_given_x = probs[i, c] if len(probs.shape) > 1 else (probs[i] if c == 1 else 1 - probs[i])
-                
-                # クラスcの場合の損失 L(fθ(x), y)
-                if len(probs.shape) > 1:
-                    # 多クラス分類の場合
-                    y_one_hot = np.zeros(n_classes)
-                    y_one_hot[c] = 1
-                    loss = -np.sum(y_one_hot * np.log(probs[i] + 1e-10))
-                else:
-                    # 二値分類の場合
-                    loss = -np.log(probs[i] + 1e-10) if c == 1 else -np.log(1 - probs[i] + 1e-10)
-                
-                # 二乗差分
-                sq_diff = (loss - R) ** 2
-                
-                # 期待値に寄与
-                sq_diff_sum += p_y_given_x * sq_diff
+            class_probs = probs[i]
+            expected_loss = 0
+            squared_diff = 0
             
-            expected_sq_diff[i] = sq_diff_sum
+            # 各クラスについて損失の期待値を計算
+            for c in range(len(class_probs)):
+                # このクラスの予測確率
+                prob_c = class_probs[c]
+                
+                # このクラスが正解だった場合の損失
+                y_c = np.zeros_like(class_probs)
+                y_c[c] = 1
+                loss_c = -np.sum(y_c * np.log(class_probs + 1e-10))
+                
+                # 損失と真のリスクの二乗差
+                squared_diff += prob_c * (loss_c - R) ** 2
+            
+            expected_squared_diff[i] = squared_diff
         
         # プール分布p(x)はプール上で一様
         p_x = np.ones(len(X_pool)) / len(X_pool)
         
         # 提案分布q*(x)を計算
-        q_star = p_x * np.sqrt(expected_sq_diff)
+        q_star = p_x * np.sqrt(expected_squared_diff)
         
         # 除外インデックスをマスク
         mask = np.ones(len(X_pool), dtype=bool)
@@ -92,7 +86,7 @@ class ActiveTester:
         else:
             # すべての値がゼロの場合、一様分布を使用
             q_star[mask] = 1 / np.sum(mask)
-        
+            
         return q_star
 
     def select_test_samples(self, X_pool, q_proposal, n_samples=1, excluded_indices=None):
@@ -170,10 +164,30 @@ class ActiveTester:
         return np.array(selected_indices), np.array(weights)
 
     def estimate_risk(self, X, y, weights=None):
-        # モデルの損失平均
+        """
+        重み付きサンプルからリスクを推定します（論文の式(2)と付録B.1の式(14)に基づく）
+        
+        Parameters:
+        -----------
+        X : numpy.ndarray
+            特徴量データ
+        y : numpy.ndarray
+            ラベルデータ
+        weights : numpy.ndarray, optional
+            サンプルの重み
+        
+        Returns:
+        --------
+        weighted_loss : float
+            推定されたリスク
+        """
         if weights is None:
             weights = np.ones(len(X))
+            
+        # モデルの予測確率を取得
         probs = self.model.predict_proba(X)
+        
+        # 損失を計算
         if len(probs.shape) > 1 and probs.shape[1] > 1:
             # 多クラス分類
             n_classes = probs.shape[1]
@@ -181,10 +195,17 @@ class ActiveTester:
             y_one_hot[np.arange(len(y)), y.astype(int)] = 1
             losses = -np.sum(y_one_hot * np.log(probs + 1e-10), axis=1)
         else:
+            # 二値分類
             losses = -y * np.log(probs + 1e-10) - (1 - y) * np.log(1 - probs + 1e-10)
-        weighted_loss = np.sum(weights * losses) / np.sum(weights)
-
-        return weighted_loss # 重み付き平均
+        
+        # 重み付き損失の合計とウェイトの合計を計算
+        weighted_loss_sum = np.sum(weights * losses)
+        weight_sum = np.sum(weights)
+        
+        # 重み付き平均を計算
+        weighted_loss = weighted_loss_sum / weight_sum
+        
+        return weighted_loss
     
     def compute_multi_source_risk(self, X_train, y_train, X_test, y_test, X_pool):
         """
@@ -281,7 +302,7 @@ class ActiveTester:
     
     def integrated_risk_estimation(self, X_quizzes, y_quizzes, quiz_weights, model=None):
         """
-        複数のクイズ結果を統合してリスクを推定します（論文のTheorem 1に基づく）
+        複数のクイズ結果を統合してリスクを推定します（論文の式(7)と付録B.1に基づく）
         
         Parameters:
         -----------
@@ -302,21 +323,19 @@ class ActiveTester:
         if model is None:
             model = self.model
             
-        # 各クイズの信頼度を計算
+        # 各クイズの信頼度（Ct）を計算
         confidences = []
         risk_estimates = []
-        n_samples = []
         
-        for X_quiz, y_quiz, weights in zip(X_quizzes, y_quizzes, quiz_weights):
+        for t, (X_quiz, y_quiz, weights) in enumerate(zip(X_quizzes, y_quizzes, quiz_weights)):
             if len(X_quiz) == 0:
                 continue
                 
             # このクイズのリスクを推定
             risk = self.estimate_risk(X_quiz, y_quiz, weights)
             risk_estimates.append(risk)
-            n_samples.append(len(X_quiz))
             
-            # 式(7)に基づいて信頼度（分散の逆数）を計算
+            # 信頼度（分散の逆数）を計算
             probs = model.predict_proba(X_quiz)
             
             if len(probs.shape) > 1 and probs.shape[1] > 1:
@@ -335,15 +354,14 @@ class ActiveTester:
             # 重要度重みを適用して分散を計算
             weighted_sq_diff = np.sum(weights * sq_diff) / np.sum(weights)
             
-            # サンプル数を考慮した信頼度
-            # Theorem 1に基づき、分散はサンプル数に反比例する
-            confidence = len(X_quiz) / (weighted_sq_diff + 1e-10)
+            # 信頼度はCt = 1/σ²_t
+            confidence = 1 / (weighted_sq_diff + 1e-10)
             confidences.append(confidence)
             
         if not confidences:
             return 0
             
-        # 信頼度を正規化して重みを取得（Theorem 1のvt）
+        # 信頼度を正規化して重み（vt）を取得
         confidences = np.array(confidences)
         v_weights = confidences / np.sum(confidences)
         
@@ -351,10 +369,10 @@ class ActiveTester:
         integrated_risk = np.sum(v_weights * np.array(risk_estimates))
         
         return integrated_risk
-    
+
     def select_feedback_samples(self, X_test, y_test, X_train, test_indices, q_proposal, n_feedback=1):
         """
-        テストセットからフィードバックサンプルを選択します（リスク推定への影響を考慮）
+        テストセットからフィードバックサンプルを選択します（論文の式(9)と付録Aの表記法に基づく）
         
         Parameters:
         -----------
@@ -392,42 +410,32 @@ class ActiveTester:
             # 二値分類
             losses = -y_test * np.log(probs + 1e-10) - (1 - y_test) * np.log(1 - probs + 1e-10)
         
-        # 多様性を計算
+        # 多様性メトリックd(SL, x)を計算
         if len(X_train) > 0:
-            # 距離行列を計算
-            dist_matrix = cdist(X_test, X_train)
+            # 付録Aの表記法に基づいて多様性行列ALを計算
+            epsilon = 1e-6  # 特異性を避けるための小さな正の値
+            AL = epsilon * np.eye(X_train.shape[1])
             
-            # 訓練セットへの最小距離を計算
-            min_distances = np.min(dist_matrix, axis=1)
+            for z in X_train:
+                z = z.reshape(-1, 1)
+                AL += np.dot(z, z.T)
+            
+            # 各テストサンプルの多様性スコアを計算
+            diversity = np.zeros(len(X_test))
+            AL_inv = np.linalg.inv(AL)
+            
+            for i, x in enumerate(X_test):
+                x = x.reshape(-1, 1)
+                diversity[i] = np.sqrt(np.dot(np.dot(x.T, AL_inv), x))[0, 0]
             
             # 正規化
-            if np.max(min_distances) > 0:
-                diversity = min_distances / np.max(min_distances)
-            else:
-                diversity = np.ones_like(min_distances)
+            if np.max(diversity) > 0:
+                diversity = diversity / np.max(diversity)
         else:
             diversity = np.ones(len(X_test))
-        
-        # リスク推定への影響を計算
-        # 各サンプルを除外した場合のリスク推定値の変化を推定
-        risk_impact = np.zeros(len(X_test))
-        mean_loss = np.mean(losses)
-        for i in range(len(X_test)):
-            # i番目のサンプルを除外した場合の平均損失
-            remaining_losses = np.delete(losses, i)
-            new_mean_loss = np.mean(remaining_losses) if len(remaining_losses) > 0 else mean_loss
-            # リスク推定への影響は元の平均との差の絶対値
-            risk_impact[i] = abs(new_mean_loss - mean_loss)
-        
-        # リスク推定への影響を正規化
-        if np.max(risk_impact) > 0:
-            risk_impact = risk_impact / np.max(risk_impact)
-        
-        # 式(9)に従ってフィードバックスコアを計算
-        # q_FB(x, y; η) = q^(t)(x)L(ft(x), y) + ηd(SL, x)
-        eta = 0.8  # 論文の結果に合わせてηを調整（0.5から0.8に）
-        
-        # 以下のコードは同じ
+            
+        # フィードバックスコアを計算（式(9)）
+        eta = 0.5  # バランシングパラメータ
         feedback_scores = q_proposal[test_indices] * losses + eta * diversity
         
         # 上位n_feedbackサンプルを選択

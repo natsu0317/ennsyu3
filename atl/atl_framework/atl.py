@@ -221,85 +221,62 @@ class ATLFramework:
         )
         self.integrated_risk_history.append(integrated_risk)
         
+        # 真のリスクを計算（評価用）
+        if self.y_pool is not None:
+            # 全データに対する真のリスクを計算
+            true_risk = cross_entropy_loss(self.model.predict_proba(self.X_pool), self.y_pool)
+            self.true_risk_history.append(true_risk)
+        
         return selected_indices
     
     def check_early_stopping(self):
         """
-        早期停止条件を満たしているかチェックします
+        早期停止条件を満たしているかチェックします（付録Aの表記法に基づく）
         
         Returns:
         --------
         stop : bool
             早期停止条件を満たしている場合はTrue
         """
-        # 最低ラウンド数を確保（論文に忠実に）
-        min_rounds = 15
-        if len(self.integrated_risk_history) < min_rounds:
-            return False
-        
-        # 十分なデータポイントがない場合は早期停止しない
         if len(self.integrated_risk_history) < self.window_size + 1:
             return False
-        
+            
         # 統合リスクの移動平均の変化を計算
         window = self.window_size
         current_avg = np.mean(self.integrated_risk_history[-window:])
         previous_avg = np.mean(self.integrated_risk_history[-(window+1):-1])
-        delta_risk = abs(current_avg - previous_avg) / previous_avg  # 相対変化
+        delta_risk = abs(current_avg - previous_avg)
         
         # 未ラベルデータを取得
         X_unlabeled, _ = self.get_unlabeled_data()
         
         # 安定化予測（SP）を計算
         if len(X_unlabeled) > 0:
-            # サンプルを減らして計算効率を向上（大規模データセットの場合）
-            if len(X_unlabeled) > 1000:
-                indices = np.random.choice(len(X_unlabeled), size=1000, replace=False)
-                X_sample = X_unlabeled[indices]
-            else:
-                X_sample = X_unlabeled
-            
             # 現在のモデル予測を取得
-            current_probs = self.model.predict_proba(X_sample)
+            current_probs = self.model.predict_proba(X_unlabeled)
             
             # 最新のサンプルなしで一時的なモデルを訓練
             temp_model = copy.deepcopy(self.model)
-            
-            # 最新のフィードバックサンプルを除外
-            n_recent = min(len(self.feedback_indices), self.test_batch_size)
-            recent_feedback = self.feedback_indices[-n_recent:] if n_recent > 0 else []
-            
-            # 最新のALサンプルを除外
-            n_recent_al = min(len(self.labeled_indices) - len(self.feedback_indices), self.test_batch_size)
-            labeled_without_feedback = [idx for idx in self.labeled_indices if idx not in self.feedback_indices]
-            recent_al = labeled_without_feedback[-n_recent_al:] if n_recent_al > 0 else []
-            
-            # 除外するインデックス
-            excluded = recent_feedback + recent_al
-            
-            # 除外インデックスなしのラベル付きデータ
-            included_indices = [idx for idx in self.labeled_indices if idx not in excluded]
-            X_prev_labeled = self.X_pool[included_indices]
-            y_prev_labeled = self.y_pool[included_indices]
-            
-            # 前のモデルを訓練
+            X_prev_labeled = self.X_pool[self.labeled_indices[:-self.test_batch_size]]
+            y_prev_labeled = self.y_pool[self.labeled_indices[:-self.test_batch_size]]
             temp_model.fit(X_prev_labeled, y_prev_labeled)
             
             # 以前の予測を取得
-            prev_probs = temp_model.predict_proba(X_sample)
+            prev_probs = temp_model.predict_proba(X_unlabeled)
             
             # 予測変化を計算
             pred_changes = np.mean(np.abs(current_probs - prev_probs))
             sp = 1 - pred_changes
         else:
             sp = 1.0
+            
+        # 付録Aのλパラメータを使用して組み合わせた停止基準
+        lambda_param = 0.5  # リスク推定と未ラベル情報のバランスを取るパラメータ
+        combined_criterion = lambda_param * delta_risk + (1 - lambda_param) * (1 - sp)
         
-        # 組み合わせた停止基準（論文に忠実に）
-        # 非常に小さなしきい値を使用して、早期停止を防ぐ
-        threshold = 0.001  # リスク変化のしきい値
-        sp_threshold = 0.99  # 安定化予測のしきい値
+        threshold = 0.01  # 組み合わせた基準のしきい値
         
-        return delta_risk < threshold and sp > sp_threshold
+        return combined_criterion < threshold
 
     def run_active_learning(self, n_rounds=10, n_samples_per_round=10):
         """
@@ -389,6 +366,3 @@ class ATLFramework:
                 self.model.fit(X_labeled, y_labeled)
         
         return self.model
-
-            
-
