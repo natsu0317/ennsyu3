@@ -9,7 +9,7 @@ from utils.losses import cross_entropy_loss
 from sklearn.metrics import accuracy_score
 import types
 
-def compare_atl_variants(dataset_name, n_rounds=20, n_samples_per_round=500, n_test_per_round=100, n_runs=3):
+def compare_atl_variants(dataset_name, rounds_to_check=[4, 8, 12, 16, 20], n_rounds=20, n_samples_per_round=500, n_test_per_round=100, n_runs=3):
     """
     ATL, ATL-NF, ATL-RFの性能を詳細に比較します。
     
@@ -17,6 +17,8 @@ def compare_atl_variants(dataset_name, n_rounds=20, n_samples_per_round=500, n_t
     -----------
     dataset_name : str
         データセット名 ('mnist', 'fashion_mnist', 'cifar10')
+    rounds_to_check : list, optional
+        リスクを記録するラウンド
     n_rounds : int, optional
         アクティブラーニングのラウンド数
     n_samples_per_round : int, optional
@@ -35,9 +37,9 @@ def compare_atl_variants(dataset_name, n_rounds=20, n_samples_per_round=500, n_t
     
     # 結果を格納する辞書
     all_results = {
-        'ATL': {'accuracy': [], 'risk': [], 'labels': [], 'time': [], 'estimation_error': []},
-        'ATL-NF': {'accuracy': [], 'risk': [], 'labels': [], 'time': [], 'estimation_error': []},
-        'ATL-RF': {'accuracy': [], 'risk': [], 'labels': [], 'time': [], 'estimation_error': []}
+        'ATL': {'risks_by_round': {r: [] for r in rounds_to_check}},
+        'ATL-NF': {'risks_by_round': {r: [] for r in rounds_to_check}},
+        'ATL-RF': {'risks_by_round': {r: [] for r in rounds_to_check}}
     }
     
     for run in range(n_runs):
@@ -71,9 +73,6 @@ def compare_atl_variants(dataset_name, n_rounds=20, n_samples_per_round=500, n_t
             # インデックスを初期化
             initial_indices = list(range(len(X_initial)))
             
-            # 開始時間を記録
-            start_time = time.time()
-            
             # ATLフレームワークを初期化
             atl = ATLFramework(
                 model=model,
@@ -99,150 +98,141 @@ def compare_atl_variants(dataset_name, n_rounds=20, n_samples_per_round=500, n_t
                 
                 atl.active_tester.select_feedback_samples = types.MethodType(random_feedback, atl.active_tester)
             
+            # 早期停止を無効化
+            def no_early_stopping(self):
+                return False
+            
+            atl.check_early_stopping = types.MethodType(no_early_stopping, atl)
+            
+            # 各ラウンドでのリスクを保存するための辞書
+            round_risks = {}
+            
             # アクティブラーニングを実行
-            atl.run_active_learning(n_rounds=n_rounds, n_samples_per_round=n_samples_per_round)
+            for al_round in range(n_rounds):
+                print(f"  Active Learning Round {al_round+1}/{n_rounds}")
+                
+                # 現在のラベル付きデータを取得
+                X_labeled, y_labeled = atl.get_labeled_data()
+                
+                # ラベル付きデータでモデルを学習
+                if len(X_labeled) > 0 and y_labeled is not None:
+                    model.fit(X_labeled, y_labeled)
+                
+                # テスト頻度に応じてアクティブテストを実行
+                if al_round % atl.test_frequency == 0:
+                    print(f"    Performing active quiz...")
+                    atl.perform_active_quiz(al_round)
+                
+                # 特定のラウンドでホールドアウトリスクを計算
+                if al_round + 1 in rounds_to_check:
+                    # ホールドアウトセットで評価
+                    holdout_probs = model.predict_proba(X_holdout)
+                    holdout_risk = cross_entropy_loss(holdout_probs, y_holdout)
+                    round_risks[al_round + 1] = holdout_risk
+                    print(f"    Round {al_round+1} holdout risk: {holdout_risk:.4f}")
+                
+                # アクティブラーニングのサンプルを選択
+                X_unlabeled, unlabeled_indices = atl.get_unlabeled_data()
+                if len(X_unlabeled) == 0 or len(unlabeled_indices) == 0:
+                    print("    No more unlabeled data available.")
+                    break
+                
+                # X_unlabeledに対して選択を行い、実際のインデックスに変換
+                selected_indices = atl.active_learner.select_samples(
+                    X_unlabeled, n_samples=n_samples_per_round, 
+                    excluded_indices=[]  # X_unlabeledは既に除外済みなので空リスト
+                )
+                
+                # 選択されたインデックスを元のプールのインデックスに変換
+                original_indices = [unlabeled_indices[i] for i in selected_indices if i < len(unlabeled_indices)]
+                
+                # 選択されたサンプルがない場合の処理
+                if not original_indices:
+                    print("    No more informative samples available.")
+                    break
+                
+                # ラベル付きインデックスを更新
+                atl.labeled_indices.extend(original_indices)
+                atl.active_learner.labeled_indices.extend(original_indices)
+                
+                # 現在の統計を表示
+                if atl.y_pool is not None and len(atl.integrated_risk_history) > 0:
+                    print(f"    Labeled samples: {len(atl.labeled_indices)}")
+                    print(f"    Test samples: {len(atl.test_indices)}")
+                    print(f"    Feedback samples: {len(atl.feedback_indices)}")
             
-            # 実行時間を記録
-            execution_time = time.time() - start_time
-            
-            # ホールドアウトセットで評価
-            model.fit(atl.X_pool[atl.labeled_indices], atl.y_pool[atl.labeled_indices])
-            holdout_probs = model.predict_proba(X_holdout)
-            holdout_preds = np.argmax(holdout_probs, axis=1)
-            holdout_risk = cross_entropy_loss(holdout_probs, y_holdout)
-            holdout_accuracy = accuracy_score(y_holdout, holdout_preds)
-            
-            # ラベル数を計算
-            n_labels_used = len(atl.labeled_indices) + len(atl.test_indices)
-            
-            # 推定誤差を計算（最終ラウンドの値）
-            if len(atl.integrated_risk_history) > 0 and len(atl.true_risk_history) > 0:
-                final_estimation_error = abs(atl.integrated_risk_history[-1] - atl.true_risk_history[-1])
-            else:
-                final_estimation_error = float('nan')
-            
-            # 結果を保存
-            all_results[method]['accuracy'].append(holdout_accuracy)
-            all_results[method]['risk'].append(holdout_risk)
-            all_results[method]['labels'].append(n_labels_used)
-            all_results[method]['time'].append(execution_time)
-            all_results[method]['estimation_error'].append(final_estimation_error)
+            # 各ラウンドでのリスクを保存
+            for r in rounds_to_check:
+                if r in round_risks:
+                    all_results[method]['risks_by_round'][r].append(round_risks[r])
+                else:
+                    # ラウンドが実行されなかった場合はNaNを保存
+                    all_results[method]['risks_by_round'][r].append(float('nan'))
     
     # 平均と標準偏差を計算
     summary = {}
     for method in methods:
         summary[method] = {
-            'accuracy_mean': np.mean(all_results[method]['accuracy']),
-            'accuracy_std': np.std(all_results[method]['accuracy']),
-            'risk_mean': np.mean(all_results[method]['risk']),
-            'risk_std': np.std(all_results[method]['risk']),
-            'labels_mean': np.mean(all_results[method]['labels']),
-            'labels_std': np.std(all_results[method]['labels']),
-            'time_mean': np.mean(all_results[method]['time']),
-            'time_std': np.std(all_results[method]['time']),
-            'estimation_error_mean': np.mean(all_results[method]['estimation_error']),
-            'estimation_error_std': np.std(all_results[method]['estimation_error'])
+            'risks_by_round': {}
         }
+        for r in rounds_to_check:
+            risks = all_results[method]['risks_by_round'][r]
+            risks = [r for r in risks if not np.isnan(r)]  # NaNを除外
+            if risks:
+                summary[method]['risks_by_round'][r] = {
+                    'mean': np.mean(risks),
+                    'std': np.std(risks)
+                }
+            else:
+                summary[method]['risks_by_round'][r] = {
+                    'mean': float('nan'),
+                    'std': float('nan')
+                }
     
     # 結果を表示
-    print("\n===== Detailed Comparison Results =====")
+    print("\n===== Hold-out Test Risk by Round =====")
     
-    # テーブル形式で結果を表示
-    df = pd.DataFrame({
-        'Method': methods,
-        'Accuracy': [f"{summary[m]['accuracy_mean']:.4f} ± {summary[m]['accuracy_std']:.4f}" for m in methods],
-        'Risk': [f"{summary[m]['risk_mean']:.4f} ± {summary[m]['risk_std']:.4f}" for m in methods],
-        'Labels Used': [f"{summary[m]['labels_mean']:.0f} ± {summary[m]['labels_std']:.0f}" for m in methods],
-        'Time (s)': [f"{summary[m]['time_mean']:.2f} ± {summary[m]['time_std']:.2f}" for m in methods],
-        'Est. Error': [f"{summary[m]['estimation_error_mean']:.4f} ± {summary[m]['estimation_error_std']:.4f}" for m in methods]
-    })
+    # テーブル形式で結果を表示（論文の表2と同様のフォーマット）
+    data = []
+    for method in methods:
+        row = [method]
+        for r in rounds_to_check:
+            if not np.isnan(summary[method]['risks_by_round'][r]['mean']):
+                row.append(f"{summary[method]['risks_by_round'][r]['mean']:.2f} ± {summary[method]['risks_by_round'][r]['std']:.2f}")
+            else:
+                row.append("N/A")
+        data.append(row)
     
+    df = pd.DataFrame(data, columns=['Method'] + [f"Round {r}" for r in rounds_to_check])
     print(df.to_string(index=False))
     
-    # 相対的な比較
-    print("\n===== Relative Comparison =====")
+    # 結果をCSVに保存
+    df.to_csv(f"atl_holdout_risk_{dataset_name}.csv", index=False)
     
-    # ATLを基準とした相対的な比較
-    relative_df = pd.DataFrame({
-        'Method': ["ATL-NF vs ATL", "ATL-RF vs ATL"],
-        'Accuracy Diff': [
-            f"{summary['ATL-NF']['accuracy_mean'] - summary['ATL']['accuracy_mean']:.4f} ({(summary['ATL-NF']['accuracy_mean'] - summary['ATL']['accuracy_mean']) / summary['ATL']['accuracy_mean'] * 100:.2f}%)",
-            f"{summary['ATL-RF']['accuracy_mean'] - summary['ATL']['accuracy_mean']:.4f} ({(summary['ATL-RF']['accuracy_mean'] - summary['ATL']['accuracy_mean']) / summary['ATL']['accuracy_mean'] * 100:.2f}%)"
-        ],
-        'Risk Diff': [
-            f"{summary['ATL-NF']['risk_mean'] - summary['ATL']['risk_mean']:.4f} ({(summary['ATL-NF']['risk_mean'] - summary['ATL']['risk_mean']) / summary['ATL']['risk_mean'] * 100:.2f}%)",
-            f"{summary['ATL-RF']['risk_mean'] - summary['ATL']['risk_mean']:.4f} ({(summary['ATL-RF']['risk_mean'] - summary['ATL']['risk_mean']) / summary['ATL']['risk_mean'] * 100:.2f}%)"
-        ],
-        'Labels Diff': [
-            f"{summary['ATL-NF']['labels_mean'] - summary['ATL']['labels_mean']:.0f} ({(summary['ATL-NF']['labels_mean'] - summary['ATL']['labels_mean']) / summary['ATL']['labels_mean'] * 100:.2f}%)",
-            f"{summary['ATL-RF']['labels_mean'] - summary['ATL']['labels_mean']:.0f} ({(summary['ATL-RF']['labels_mean'] - summary['ATL']['labels_mean']) / summary['ATL']['labels_mean'] * 100:.2f}%)"
-        ],
-        'Est. Error Diff': [
-            f"{summary['ATL-NF']['estimation_error_mean'] - summary['ATL']['estimation_error_mean']:.4f} ({(summary['ATL-NF']['estimation_error_mean'] - summary['ATL']['estimation_error_mean']) / summary['ATL']['estimation_error_mean'] * 100:.2f}%)",
-            f"{summary['ATL-RF']['estimation_error_mean'] - summary['ATL']['estimation_error_mean']:.4f} ({(summary['ATL-RF']['estimation_error_mean'] - summary['ATL']['estimation_error_mean']) / summary['ATL']['estimation_error_mean'] * 100:.2f}%)"
-        ]
-    })
+    # グラフで可視化
+    plt.figure(figsize=(12, 6))
     
-    print(relative_df.to_string(index=False))
+    for method in methods:
+        means = []
+        stds = []
+        for r in rounds_to_check:
+            if not np.isnan(summary[method]['risks_by_round'][r]['mean']):
+                means.append(summary[method]['risks_by_round'][r]['mean'])
+                stds.append(summary[method]['risks_by_round'][r]['std'])
+            else:
+                means.append(np.nan)
+                stds.append(np.nan)
+        
+        plt.errorbar(rounds_to_check, means, yerr=stds, marker='o', label=method)
     
-    # 最良の方法を特定
-    best_accuracy = max([summary[m]['accuracy_mean'] for m in methods])
-    best_accuracy_method = methods[[summary[m]['accuracy_mean'] for m in methods].index(best_accuracy)]
-    
-    lowest_risk = min([summary[m]['risk_mean'] for m in methods])
-    lowest_risk_method = methods[[summary[m]['risk_mean'] for m in methods].index(lowest_risk)]
-    
-    lowest_error = min([summary[m]['estimation_error_mean'] for m in methods])
-    lowest_error_method = methods[[summary[m]['estimation_error_mean'] for m in methods].index(lowest_error)]
-    
-    print("\n===== Best Performing Method =====")
-    print(f"Best Accuracy: {best_accuracy_method} ({best_accuracy:.4f})")
-    print(f"Lowest Risk: {lowest_risk_method} ({lowest_risk:.4f})")
-    print(f"Lowest Estimation Error: {lowest_error_method} ({lowest_error:.4f})")
-    
-    # 結果をグラフで可視化
-    plt.figure(figsize=(15, 12))
-    
-    # 1. 精度比較
-    plt.subplot(2, 2, 1)
-    accuracy_means = [summary[m]['accuracy_mean'] for m in methods]
-    accuracy_stds = [summary[m]['accuracy_std'] for m in methods]
-    plt.bar(methods, accuracy_means, yerr=accuracy_stds)
-    plt.ylabel('Accuracy')
-    plt.title('Holdout Accuracy Comparison')
-    plt.ylim(min(accuracy_means) * 0.95, max(accuracy_means) * 1.05)
-    
-    # 2. リスク比較
-    plt.subplot(2, 2, 2)
-    risk_means = [summary[m]['risk_mean'] for m in methods]
-    risk_stds = [summary[m]['risk_std'] for m in methods]
-    plt.bar(methods, risk_means, yerr=risk_stds)
-    plt.ylabel('Risk (Cross-Entropy Loss)')
-    plt.title('Holdout Risk Comparison')
-    
-    # 3. ラベル使用量比較
-    plt.subplot(2, 2, 3)
-    labels_means = [summary[m]['labels_mean'] for m in methods]
-    labels_stds = [summary[m]['labels_std'] for m in methods]
-    plt.bar(methods, labels_means, yerr=labels_stds)
-    plt.ylabel('Number of Labels Used')
-    plt.title('Label Usage Comparison')
-    
-    # 4. 推定誤差比較
-    plt.subplot(2, 2, 4)
-    error_means = [summary[m]['estimation_error_mean'] for m in methods]
-    error_stds = [summary[m]['estimation_error_std'] for m in methods]
-    plt.bar(methods, error_means, yerr=error_stds)
-    plt.ylabel('Estimation Error')
-    plt.title('Risk Estimation Error Comparison')
-    
-    plt.tight_layout()
-    plt.savefig(f"atl_variants_comparison_{dataset_name}.png")
+    plt.xlabel('AL Round')
+    plt.ylabel('Hold-out Test Risk')
+    plt.title(f'Hold-out Test Risk by Round ({dataset_name})')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"atl_holdout_risk_{dataset_name}.png")
     
     return {
         'all_results': all_results,
-        'summary': summary,
-        'best_accuracy_method': best_accuracy_method,
-        'lowest_risk_method': lowest_risk_method,
-        'lowest_error_method': lowest_error_method
+        'summary': summary
     }
