@@ -183,18 +183,7 @@ class ATLFramework:
         # このクイズのリスクを推定
         quiz_risk = self.active_tester.estimate_risk(X_quiz, y_quiz, weights)
         self.risk_history.append(quiz_risk)
-        
-        # 統合リスク推定値を計算
-        integrated_risk = self.active_tester.integrated_risk_estimation(
-            self.quiz_X, self.quiz_y, self.quiz_weights
-        )
-        self.integrated_risk_history.append(integrated_risk)
-        
-        # 真のラベルが利用可能な場合、評価用に真のリスクを計算
-        if self.y_pool is not None:
-            true_risk = cross_entropy_loss(self.model.predict_proba(self.X_pool), self.y_pool)
-            self.true_risk_history.append(true_risk)
-        
+
         # フィードバックサンプルを選択
         n_feedback = int(self.feedback_ratio * len(selected_indices))
         if n_feedback > 0:
@@ -211,6 +200,26 @@ class ATLFramework:
             
             # フィードバックサンプルをテストインデックスから削除
             self.test_indices = [idx for idx in self.test_indices if idx not in feedback_indices]
+            
+            # フィードバック後に残ったテストサンプルでリスク推定を再計算
+            # これにより、フィードバック後のテストセット分布でのリスク推定が得られる
+            remaining_indices = [i for i, idx in enumerate(selected_indices) if idx not in feedback_indices]
+            if remaining_indices:
+                X_remaining = X_quiz[remaining_indices]
+                y_remaining = y_quiz[remaining_indices]
+                weights_remaining = weights[remaining_indices]
+                # 重みを再正規化
+                weights_remaining = weights_remaining / np.sum(weights_remaining)
+                # リスクを再推定
+                quiz_risk = self.active_tester.estimate_risk(X_remaining, y_remaining, weights_remaining)
+                # 履歴を更新
+                self.risk_history[-1] = quiz_risk
+
+        # 統合リスク推定値を計算
+        integrated_risk = self.active_tester.integrated_risk_estimation(
+            self.quiz_X, self.quiz_y, self.quiz_weights
+        )
+        self.integrated_risk_history.append(integrated_risk)
         
         return selected_indices
     
@@ -309,7 +318,7 @@ class ATLFramework:
             学習済みモデル
         """
         for al_round in range(n_rounds):
-            print(f"Active Learning Round {al_round+1}/{n_rounds}")
+            # print(f"Active Learning Round {al_round+1}/{n_rounds}")
             
             # 現在のラベル付きデータを取得
             X_labeled, y_labeled = self.get_labeled_data()
@@ -327,18 +336,18 @@ class ATLFramework:
             
             # テスト頻度に応じてアクティブテストを実行
             if al_round % self.test_frequency == 0:
-                print(f"  Performing active quiz...")
+                # print(f"  Performing active quiz...")
                 self.perform_active_quiz(al_round)
                 
                 # 早期停止をチェック
                 if self.check_early_stopping():
-                    print(f"  Early stopping criteria met at round {al_round+1}")
+                    # print(f"  Early stopping criteria met at round {al_round+1}")
                     break
             
             # アクティブラーニングのサンプル選択
             X_unlabeled, unlabeled_indices = self.get_unlabeled_data()
             if len(X_unlabeled) == 0 or len(unlabeled_indices) == 0:
-                print("  No more unlabeled data available.")
+                # print("  No more unlabeled data available.")
                 break
                 
             selected_indices = self.active_learner.select_samples(
@@ -350,7 +359,7 @@ class ATLFramework:
             
             # 選択されたサンプルがない場合の処理
             if not original_indices:
-                print("  No more informative samples available.")
+                # print("  No more informative samples available.")
                 break
                 
             # ラベル付きインデックスを更新
@@ -358,14 +367,14 @@ class ATLFramework:
             self.active_learner.labeled_indices.extend(original_indices)
             
             # 現在の統計を表示
-            if self.y_pool is not None and len(self.integrated_risk_history) > 0:
-                print(f"  Labeled samples: {len(self.labeled_indices)}")
-                print(f"  Test samples: {len(self.test_indices)}")
-                print(f"  Feedback samples: {len(self.feedback_indices)}")
-                print(f"  Estimated risk: {self.integrated_risk_history[-1]:.4f}")
-                if len(self.true_risk_history) > 0:
-                    print(f"  True risk: {self.true_risk_history[-1]:.4f}")
-                    print(f"  Estimation error: {abs(self.integrated_risk_history[-1] - self.true_risk_history[-1]):.4f}")
+            # if self.y_pool is not None and len(self.integrated_risk_history) > 0:
+                # print(f"  Labeled samples: {len(self.labeled_indices)}")
+                # print(f"  Test samples: {len(self.test_indices)}")
+                # print(f"  Feedback samples: {len(self.feedback_indices)}")
+                # print(f"  Estimated risk: {self.integrated_risk_history[-1]:.4f}")
+                # if len(self.true_risk_history) > 0:
+                    # print(f"  True risk: {self.true_risk_history[-1]:.4f}")
+                    # print(f"  Estimation error: {abs(self.integrated_risk_history[-1] - self.true_risk_history[-1]):.4f}")
         
         # 最終的なモデルを訓練（すべてのラベル付きデータを使用）
         X_labeled, y_labeled = self.get_labeled_data()
