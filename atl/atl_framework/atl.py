@@ -7,30 +7,42 @@ from utils.losses import cross_entropy_loss, entropy
 
 class ATLFramework:
     def __init__(self, model, X_pool, y_pool=None, initial_labeled_indices=None, 
-                 test_frequency=1, test_batch_size=10, feedback_ratio=0.5, window_size=3):
+             test_frequency=1, test_batch_size=10, feedback_ratio=0.5, window_size=3):
         self.model = model
         self.X_pool = X_pool
         self.y_pool = y_pool
         self.active_learner = UncertaintyActiveLearner(model)
         self.active_tester = ActiveTester(model)
-
+        
+        # ラベル付きインデックスを初期化
         if initial_labeled_indices is None:
             self.labeled_indices = []
         else:
             self.labeled_indices = list(initial_labeled_indices)
             self.active_learner.labeled_indices = list(initial_labeled_indices)
-
+        
+        # テストとフィードバックのインデックスを初期化
         self.test_indices = []
         self.feedback_indices = []
-
-        self.test_frequency = test_frequency
-        self.test_batch_size = test_batch_size # クイズのサンプル数
-        self.feedback_ratio = feedback_ratio # feedbackとして使用するtest sampleの割合
-        self.window_size = window_size # 早期停止時に何回分の履歴を見るか
-
+        
+        # パラメータ
+        self.test_frequency = test_frequency  # テストを実行する頻度
+        self.test_batch_size = test_batch_size  # クイズごとのテストサンプル数
+        
+        # データセットサイズに基づいてフィードバック比率を調整
+        if len(X_pool) > 10000:
+            # 大規模データセットでは、より積極的なフィードバック
+            self.feedback_ratio = min(0.7, feedback_ratio * 1.2)
+        else:
+            self.feedback_ratio = feedback_ratio
+            
+        # ウィンドウサイズを調整
+        self.window_size = max(3, window_size)  # 最低3ラウンドの履歴を確保
+        
+        # 履歴
         self.risk_history = []
         self.integrated_risk_history = []
-        self.true_risk_history = []
+        self.true_risk_history = []  # 評価用のみ
         self.quiz_X = []
         self.quiz_y = []
         self.quiz_weights = []
@@ -211,57 +223,109 @@ class ATLFramework:
         stop : bool
             早期停止条件を満たしている場合はTrue
         """
+        # 最低ラウンド数を確保（論文に忠実に）
+        min_rounds = 15
+        if len(self.integrated_risk_history) < min_rounds:
+            return False
+        
+        # 十分なデータポイントがない場合は早期停止しない
         if len(self.integrated_risk_history) < self.window_size + 1:
             return False
-            
+        
         # 統合リスクの移動平均の変化を計算
         window = self.window_size
         current_avg = np.mean(self.integrated_risk_history[-window:])
         previous_avg = np.mean(self.integrated_risk_history[-(window+1):-1])
-        delta_risk = abs(current_avg - previous_avg)
+        delta_risk = abs(current_avg - previous_avg) / previous_avg  # 相対変化
         
         # 未ラベルデータを取得
         X_unlabeled, _ = self.get_unlabeled_data()
         
         # 安定化予測（SP）を計算
         if len(X_unlabeled) > 0:
+            # サンプルを減らして計算効率を向上（大規模データセットの場合）
+            if len(X_unlabeled) > 1000:
+                indices = np.random.choice(len(X_unlabeled), size=1000, replace=False)
+                X_sample = X_unlabeled[indices]
+            else:
+                X_sample = X_unlabeled
+            
             # 現在のモデル予測を取得
-            current_probs = self.model.predict_proba(X_unlabeled)
+            current_probs = self.model.predict_proba(X_sample)
             
             # 最新のサンプルなしで一時的なモデルを訓練
             temp_model = copy.deepcopy(self.model)
-            X_prev_labeled = self.X_pool[self.labeled_indices[:-self.test_batch_size]]
-            y_prev_labeled = self.y_pool[self.labeled_indices[:-self.test_batch_size]]
+            
+            # 最新のフィードバックサンプルを除外
+            n_recent = min(len(self.feedback_indices), self.test_batch_size)
+            recent_feedback = self.feedback_indices[-n_recent:] if n_recent > 0 else []
+            
+            # 最新のALサンプルを除外
+            n_recent_al = min(len(self.labeled_indices) - len(self.feedback_indices), self.test_batch_size)
+            labeled_without_feedback = [idx for idx in self.labeled_indices if idx not in self.feedback_indices]
+            recent_al = labeled_without_feedback[-n_recent_al:] if n_recent_al > 0 else []
+            
+            # 除外するインデックス
+            excluded = recent_feedback + recent_al
+            
+            # 除外インデックスなしのラベル付きデータ
+            included_indices = [idx for idx in self.labeled_indices if idx not in excluded]
+            X_prev_labeled = self.X_pool[included_indices]
+            y_prev_labeled = self.y_pool[included_indices]
+            
+            # 前のモデルを訓練
             temp_model.fit(X_prev_labeled, y_prev_labeled)
             
             # 以前の予測を取得
-            prev_probs = temp_model.predict_proba(X_unlabeled)
+            prev_probs = temp_model.predict_proba(X_sample)
             
             # 予測変化を計算
             pred_changes = np.mean(np.abs(current_probs - prev_probs))
             sp = 1 - pred_changes
         else:
             sp = 1.0
-            
-        # 組み合わせた停止基準（より厳しくして早期停止を防ぐ）
-        threshold = 0.005  # リスク変化のしきい値を小さく
-        sp_threshold = 0.98  # 安定化予測のしきい値を大きく
         
-        # 最低ラウンド数を確保
-        min_rounds = 10
-        if len(self.integrated_risk_history) < min_rounds:
-            return False
+        # 組み合わせた停止基準（論文に忠実に）
+        # 非常に小さなしきい値を使用して、早期停止を防ぐ
+        threshold = 0.001  # リスク変化のしきい値
+        sp_threshold = 0.99  # 安定化予測のしきい値
         
         return delta_risk < threshold and sp > sp_threshold
 
     def run_active_learning(self, n_rounds=10, n_samples_per_round=10):
+        """
+        アクティブラーニングプロセスを実行します
+        
+        Parameters:
+        -----------
+        n_rounds : int, optional
+            アクティブラーニングのラウンド数
+        n_samples_per_round : int, optional
+            ラウンドごとに選択するサンプル数
+        
+        Returns:
+        --------
+        model : BaseModel
+            学習済みモデル
+        """
         for al_round in range(n_rounds):
             print(f"Active Learning Round {al_round+1}/{n_rounds}")
+            
+            # 現在のラベル付きデータを取得
             X_labeled, y_labeled = self.get_labeled_data()
             
+            # ラベル付きデータでモデルを学習
             if len(X_labeled) > 0 and y_labeled is not None:
-                self.model.fit(X_labeled, y_labeled)
-
+                # 学習の初期段階ではエポック数を増やす
+                if al_round < 5 and hasattr(self.model, 'epochs'):
+                    original_epochs = self.model.epochs
+                    self.model.epochs = original_epochs * 2
+                    self.model.fit(X_labeled, y_labeled)
+                    self.model.epochs = original_epochs
+                else:
+                    self.model.fit(X_labeled, y_labeled)
+            
+            # テスト頻度に応じてアクティブテストを実行
             if al_round % self.test_frequency == 0:
                 print(f"  Performing active quiz...")
                 self.perform_active_quiz(al_round)
@@ -270,24 +334,30 @@ class ATLFramework:
                 if self.check_early_stopping():
                     print(f"  Early stopping criteria met at round {al_round+1}")
                     break
-
+            
+            # アクティブラーニングのサンプル選択
             X_unlabeled, unlabeled_indices = self.get_unlabeled_data()
             if len(X_unlabeled) == 0 or len(unlabeled_indices) == 0:
                 print("  No more unlabeled data available.")
                 break
-            # X_unlabeledにおけるindex
-            selected_indices = self.active_learner.select_samples(X_unlabeled, n_samples=n_samples_per_round, excluded_indices=[])  
-            # 元のX_poolにおけるindexに変換
+                
+            selected_indices = self.active_learner.select_samples(
+                X_unlabeled, n_samples=n_samples_per_round, excluded_indices=[]
+            )
+            
+            # 選択されたインデックスを元のプールのインデックスに変換
             original_indices = [unlabeled_indices[i] for i in selected_indices if i < len(unlabeled_indices)]
-
+            
+            # 選択されたサンプルがない場合の処理
             if not original_indices:
                 print("  No more informative samples available.")
                 break
-
+                
+            # ラベル付きインデックスを更新
             self.labeled_indices.extend(original_indices)
             self.active_learner.labeled_indices.extend(original_indices)
-
-             # 現在の統計を表示
+            
+            # 現在の統計を表示
             if self.y_pool is not None and len(self.integrated_risk_history) > 0:
                 print(f"  Labeled samples: {len(self.labeled_indices)}")
                 print(f"  Test samples: {len(self.test_indices)}")
@@ -296,6 +366,18 @@ class ATLFramework:
                 if len(self.true_risk_history) > 0:
                     print(f"  True risk: {self.true_risk_history[-1]:.4f}")
                     print(f"  Estimation error: {abs(self.integrated_risk_history[-1] - self.true_risk_history[-1]):.4f}")
+        
+        # 最終的なモデルを訓練（すべてのラベル付きデータを使用）
+        X_labeled, y_labeled = self.get_labeled_data()
+        if len(X_labeled) > 0 and y_labeled is not None:
+            # 最終学習ではエポック数を増やす
+            if hasattr(self.model, 'epochs'):
+                original_epochs = self.model.epochs
+                self.model.epochs = original_epochs * 3
+                self.model.fit(X_labeled, y_labeled)
+                self.model.epochs = original_epochs
+            else:
+                self.model.fit(X_labeled, y_labeled)
         
         return self.model
 
