@@ -8,32 +8,43 @@ def entropy(probs):
 # utils/losses.py
 def cross_entropy_loss(y_pred, y_true):
     """
-    交差エントロピー損失を計算します。
-    論文の結果と一致させるためにスケーリングを適用します。
+    クロスエントロピー損失を計算します。
+    数値安定性を確保するために、クリッピングを適用します。
+    
+    Parameters:
+    -----------
+    y_pred : numpy.ndarray
+        予測確率
+    y_true : numpy.ndarray
+        真のラベル
+    
+    Returns:
+    --------
+    loss : float
+        クロスエントロピー損失
     """
     if isinstance(y_pred, torch.Tensor):
         y_pred = y_pred.detach().cpu().numpy()
     if isinstance(y_true, torch.Tensor):
         y_true = y_true.detach().cpu().numpy()
     
-    # スケーリング係数（論文の結果に合わせて調整）
-    scale = 3.0  # MNISTの場合
+    # 数値安定性のためのクリッピング
+    y_pred = np.clip(y_pred, 1e-10, 1 - 1e-10)
     
     if len(y_pred.shape) == 1:
         # 二値分類
-        loss = -np.mean(y_true * np.log(y_pred + 1e-10) + (1 - y_true) * np.log(1 - y_pred + 1e-10))
+        return -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
     else:
         # 多クラス分類
         if len(y_true.shape) == 1:
-            # one-hotに変換
+            # one-hotエンコーディングに変換
             n_classes = y_pred.shape[1]
             y_true_one_hot = np.zeros((len(y_true), n_classes))
             y_true_one_hot[np.arange(len(y_true)), y_true.astype(int)] = 1
             y_true = y_true_one_hot
-        loss = -np.mean(np.sum(y_true * np.log(y_pred + 1e-10), axis=1))
-    
-    # スケーリングを適用
-    return scale * loss
+        
+        # クロスエントロピー損失を計算
+        return -np.mean(np.sum(y_true * np.log(y_pred), axis=1))
 # y_true = [2,0,1]
 # y_true_one_hot = [[1,0,0],
 #                   [0,0,0],
